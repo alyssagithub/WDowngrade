@@ -1,0 +1,8 @@
+WDowngrade.exe
+version-*/
+Downgrade_*/
+*.zip
+*.pdb
+*.log
+bin/
+obj/

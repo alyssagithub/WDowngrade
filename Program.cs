@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Diagnostics;
 using Microsoft.Win32;
+using System.Security.Principal;
 
 namespace WDowngrade {
     public class Executor {
@@ -21,7 +22,7 @@ namespace WDowngrade {
     }
 
     public class Program {
-        private const string ScriptVersion = "v1.0.2";
+        private const string ScriptVersion = "v1.0.3";
         private static string robloxLocalPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Roblox", "Versions");
         private static readonly HttpClient client = new HttpClient();
         
@@ -31,15 +32,26 @@ namespace WDowngrade {
 
         public static void Main(string[] args) {
             Console.Title = "WDowngrade";
-            ServicePointManager.Expect100Continue = true;
-            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072 | (SecurityProtocolType)12288 | SecurityProtocolType.Tls;
+            
+            // Enable all common TLS versions and bypass certificate validation for maximum compatibility
+            try {
+                ServicePointManager.Expect100Continue = false;
+                ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072 | (SecurityProtocolType)768 | (SecurityProtocolType)192;
+                try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)12288; } catch { }
+            } catch { }
 
             try {
-                RunAsync().Wait();
+                RunAsync().GetAwaiter().GetResult();
             } catch (Exception ex) {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("\n[ERROR] Fatality: " + ex.Message);
-                if (ex.InnerException != null) Console.WriteLine("Details: " + ex.InnerException.Message);
+                Exception realEx = ex;
+                while (realEx.InnerException != null) realEx = realEx.InnerException;
+                
+                Console.WriteLine("\nerror: " + realEx.Message);
+                if (ex != realEx) Console.WriteLine("details: " + ex.Message);
+                
+                HandleSslFallback().GetAwaiter().GetResult();
             }
             Console.ForegroundColor = ConsoleColor.Gray;
             Console.WriteLine("\nPress any key to exit...");
@@ -79,16 +91,38 @@ namespace WDowngrade {
             } catch { }
 
             // 2. Fetch & Select Executor
-            List<Executor> executors;
-            var requestSync = new HttpRequestMessage(HttpMethod.Get, "https://whatexpsare.online/api/status/exploits");
-            requestSync.Headers.UserAgent.Clear();
-            requestSync.Headers.UserAgent.ParseAdd("WEAO-3PService");
-            var responseSync = await client.SendAsync(requestSync);
-            responseSync.EnsureSuccessStatusCode();
-            var jsonSync = await responseSync.Content.ReadAsStringAsync();
-            var serializerSync = new JavaScriptSerializer();
-            var all = serializerSync.Deserialize<List<Executor>>(jsonSync);
-            executors = all.Where(e => e.platform == "Windows" && e.rbxversion != null && e.rbxversion.StartsWith("version-") && e.extype == "wexecutor").ToList();
+            List<Executor> executors = null;
+
+            bool syncFailed = false;
+            for (int i = 0; i < 3; i++) {
+                bool success = false;
+                try {
+                    var requestSync = new HttpRequestMessage(HttpMethod.Get, "https://whatexpsare.online/api/status/exploits");
+                    requestSync.Headers.UserAgent.Clear();
+                    requestSync.Headers.UserAgent.ParseAdd("WEAO-3PService");
+                    
+                    var responseSync = await client.SendAsync(requestSync);
+                    responseSync.EnsureSuccessStatusCode();
+                    var jsonSync = await responseSync.Content.ReadAsStringAsync();
+                    var serializerSync = new JavaScriptSerializer();
+                    var all = serializerSync.Deserialize<List<Executor>>(jsonSync);
+                    executors = all.Where(e => e.platform == "Windows" && e.rbxversion != null && e.rbxversion.StartsWith("version-") && e.extype == "wexecutor").ToList();
+                    success = true;
+                } catch (Exception) {
+                    if (i == 2) syncFailed = true;
+                }
+                
+                if (success) break;
+                
+                if (!syncFailed) {
+                    Console.WriteLine("syncing failed, retrying (" + (i + 1) + "/3)...");
+                    await Task.Delay(2000);
+                }
+            }
+
+            if (syncFailed) {
+                throw new Exception("failed to connect to the url (you might need to use a vpn like https://1.1.1.1)");
+            }
 
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("\navailable executors:");
@@ -252,6 +286,86 @@ namespace WDowngrade {
                     }
                 }
             } catch { }
+        }
+
+        private static bool IsAdmin() {
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent()) {
+                WindowsPrincipal principal = new WindowsPrincipal(identity);
+                return principal.IsInRole(WindowsBuiltInRole.Administrator);
+            }
+        }
+
+        private static async Task HandleSslFallback() {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.Write("\nif you'd like to manually downgrade, then enter the full roblox version-xxxx.. hash you want to downgrade to: ");
+            string versionInput = Console.ReadLine();
+            string version = (versionInput != null) ? versionInput.Trim() : "";
+            if (string.IsNullOrEmpty(version) || !version.StartsWith("version-")) {
+                Console.WriteLine("the version hash should start with 'version-'");
+                return;
+            }
+
+            string url = string.Format("https://rdd.whatexpsare.online/?channel=LIVE&binaryType=WindowsPlayer&version={0}&parallelDownloads=true&exploit=Velocity", version);
+            Console.WriteLine("\nan rdd tab will be opened in your browser, do not close it until it's done");
+            try {
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            } catch {
+                Console.WriteLine("\ncouldn't open browser automatically, please open the URL below in your browser");
+                Console.WriteLine(url);
+            }
+
+            string downloadsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+            DateTime startTime = DateTime.Now.AddSeconds(-10); // allow some buffer
+            string downloadedFile = null;
+
+            while (downloadedFile == null) {
+                if (Directory.Exists(downloadsPath)) {
+                    var files = Directory.GetFiles(downloadsPath, "*.zip");
+                    foreach (var file in files) {
+                        try {
+                            var info = new FileInfo(file);
+                            // RDD zip usually contains "Roblox" and the version string
+                            if (info.CreationTime >= startTime && (info.Name.Contains(version) || (info.Name.Contains("Roblox") && info.Length > 50 * 1024 * 1024))) {
+                                // Try to open it to see if it's finished (browser releases lock when done)
+                                using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.None)) {
+                                    downloadedFile = file;
+                                    break;
+                                }
+                            }
+                        } catch {
+                            // File is likely still being written by the browser or locked
+                        }
+                    }
+                }
+                await Task.Delay(2000);
+            }
+            
+            await Task.Delay(1000); // Give browser a moment to finish its clean-up
+
+            string targetDir = Path.Combine(Path.GetDirectoryName(downloadedFile), Path.GetFileName(downloadedFile).Replace(".zip", ""));
+            if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
+
+            try {
+                // Ensure extraction starts fresh
+                if (Directory.Exists(targetDir)) {
+                    foreach (var file in Directory.GetFiles(targetDir)) File.Delete(file);
+                    foreach (var subDir in Directory.GetDirectories(targetDir)) Directory.Delete(subDir, true);
+                }
+
+                ZipFile.ExtractToDirectory(downloadedFile, targetDir);
+                File.Delete(downloadedFile);
+                Process.Start("explorer.exe", targetDir);
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("\ndone, read the steps below to run the downgraded roblox");
+                Console.ResetColor();
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.WriteLine("1. go to the folder: " + targetDir);
+                Console.WriteLine("2. run the 'RobloxPlayerBeta.exe' inside of it");
+                Console.WriteLine("do this every time you want to use this downgraded version");
+                Console.ResetColor();
+            } catch (Exception ex) {
+                Console.WriteLine("\nfailed to extract: " + ex.Message);
+            }
         }
     }
 }
